@@ -164,6 +164,7 @@ struct pjmedia_stream
     pjmedia_jbuf	    *jb;	    /**< Jitter buffer.		    */
     char		     jb_last_frm;   /**< Last frame type from jb    */
     unsigned		     jb_last_frm_cnt;/**< Last JB frame type counter*/
+    unsigned		     soft_start_cnt;/**< Stream soft start counter */
 
     pjmedia_rtcp_session     rtcp;	    /**< RTCP for incoming RTP.	    */
 
@@ -514,6 +515,19 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
 
     /* Return no frame is channel is paused */
     if (channel->paused) {
+	frame->type = PJMEDIA_FRAME_TYPE_NONE;
+	return PJ_SUCCESS;
+    }
+
+    if (stream->soft_start_cnt) {
+	if (stream->soft_start_cnt == PJMEDIA_STREAM_SOFT_START) {
+	    PJ_LOG(4,(stream->port.info.name.ptr,
+		      "Resetting jitter buffer in stream playback start"));
+	    pj_mutex_lock( stream->jb_mutex );
+	    pjmedia_jbuf_reset(stream->jb);
+	    pj_mutex_unlock( stream->jb_mutex );
+	}
+	--stream->soft_start_cnt;
 	frame->type = PJMEDIA_FRAME_TYPE_NONE;
 	return PJ_SUCCESS;
     }
@@ -1318,12 +1332,6 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
     }
 #endif
 
-    /* Don't do anything if stream is paused */
-    if (channel->paused) {
-	stream->enc_buf_pos = stream->enc_buf_count = 0;
-	return PJ_SUCCESS;
-    }
-
     /* Number of samples in the frame */
     if (frame->type == PJMEDIA_FRAME_TYPE_AUDIO)
 	ts_len = ((unsigned)frame->size >> 1) /
@@ -1333,9 +1341,6 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
 		 PJMEDIA_PIA_CCNT(&stream->port.info);
     else
 	ts_len = 0;
-
-    /* Increment transmit duration */
-    stream->tx_duration += ts_len;
 
 #if defined(PJMEDIA_HANDLE_G722_MPEG_BUG) && (PJMEDIA_HANDLE_G722_MPEG_BUG!=0)
     /* Handle special case for audio codec with RTP timestamp inconsistence
@@ -1348,6 +1353,23 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
 #else
     rtp_ts_len = ts_len;
 #endif
+
+    /* Don't do anything if stream is paused, except updating RTP timestamp */
+    if (channel->paused) {
+	stream->enc_buf_pos = stream->enc_buf_count = 0;
+
+	/* Update RTP session's timestamp. */
+	status = pjmedia_rtp_encode_rtp( &channel->rtp, 0, 0, 0, rtp_ts_len,
+					 NULL, NULL);
+
+	/* Update RTCP stats with last RTP timestamp. */
+	stream->rtcp.stat.rtp_tx_last_ts = pj_ntohl(channel->rtp.out_hdr.ts);
+
+	return PJ_SUCCESS;
+    }
+
+    /* Increment transmit duration */
+    stream->tx_duration += ts_len;
 
     /* Init frame_out buffer. */
     frame_out.buf = ((char*)channel->out_pkt) + sizeof(pjmedia_rtp_hdr);
@@ -2356,6 +2378,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_create( pjmedia_endpt *endpt,
     stream->last_dtmf = -1;
     stream->jb_last_frm = PJMEDIA_JB_NORMAL_FRAME;
     stream->rtcp_fb_nack.pid = -1;
+    stream->soft_start_cnt = PJMEDIA_STREAM_SOFT_START;
 
 #if defined(PJMEDIA_STREAM_ENABLE_KA) && PJMEDIA_STREAM_ENABLE_KA!=0
     stream->use_ka = info->use_ka;
@@ -3113,6 +3136,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_resume( pjmedia_stream *stream,
 
     if ((dir & PJMEDIA_DIR_DECODING) && stream->dec) {
 	stream->dec->paused = 0;
+	stream->soft_start_cnt = PJMEDIA_STREAM_SOFT_START;
 	PJ_LOG(4,(stream->port.info.name.ptr, "Decoder stream resumed"));
     }
 
